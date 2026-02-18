@@ -1,24 +1,20 @@
 import os
 import json
 import logging
+import asyncio
+import aiohttp
 from datetime import date, datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
-)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
-
-# Состояния диалога
-WAITING_BALANCE = 1
-WAITING_DATE = 2
-
-# Хранилище данных (простой JSON-файл)
+API = f"https://api.telegram.org/bot{TOKEN}"
 DATA_FILE = "data.json"
+
+WAITING_BALANCE = "waiting_balance"
+WAITING_DATE = "waiting_date"
+IDLE = "idle"
 
 
 def load_data():
@@ -27,190 +23,145 @@ def load_data():
             return json.load(f)
     return {}
 
-
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def get_user(uid):
+    return load_data().get(str(uid), {})
 
-def get_user_data(user_id: str):
+def set_user(uid, info):
     data = load_data()
-    return data.get(user_id)
-
-
-def set_user_data(user_id: str, user_info: dict):
-    data = load_data()
-    data[user_id] = user_info
+    data[str(uid)] = info
     save_data(data)
 
 
-def calc_daily_budget(balance: float, end_date: date) -> tuple[float, int]:
+def calc_daily(balance, end_date_str):
+    end = datetime.strptime(end_date_str, "%d.%m.%Y").date()
     today = date.today()
-    days = (end_date - today).days + 1  # включаем сегодня
+    days = (end - today).days + 1
     if days <= 0:
         return 0, 0
-    daily = balance / days
-    return round(daily, 2), days
+    return round(balance / days, 2), days
 
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📊 Мой бюджет")],
-         [KeyboardButton("✏️ Обновить баланс"), KeyboardButton("📅 Изменить дату")]],
-        resize_keyboard=True
-    )
+async def tg(session, method, **kwargs):
+    async with session.post(f"{API}/{method}", json=kwargs) as r:
+        return await r.json()
+
+async def send(session, chat_id, text, keyboard=None):
+    params = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        params["reply_markup"] = {"keyboard": keyboard, "resize_keyboard": True}
+    await tg(session, "sendMessage", **params)
+
+def main_kb():
+    return [
+        [{"text": "📊 Мой бюджет"}],
+        [{"text": "✏️ Обновить баланс"}, {"text": "📅 Изменить дату"}]
+    ]
 
 
-# /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я помогу тебе следить за бюджетом.\n\n"
-        "Ты вводишь сумму и дату, до которой нужно дожить — "
-        "я посчитаю, сколько можно тратить каждый день.\n\n"
-        "Давай начнём! Введи свой текущий баланс (число):",
-        reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
-    )
-    return WAITING_BALANCE
+async def handle_message(session, message):
+    chat_id = message["chat"]["id"]
+    uid = str(chat_id)
+    text = message.get("text", "").strip()
 
+    user = get_user(uid)
+    state = user.get("state", IDLE)
 
-# Получаем баланс
-async def get_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.replace(",", ".").replace(" ", "")
-    try:
-        balance = float(text)
-        if balance < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Введи корректное число, например: 15000 или 15000.50")
-        return WAITING_BALANCE
-
-    context.user_data["balance"] = balance
-    await update.message.reply_text(
-        f"✅ Баланс: {balance:,.2f} ₽\n\n"
-        "Теперь введи дату, до которой нужно дожить.\n"
-        "Формат: ДД.ММ.ГГГГ, например: 31.03.2025"
-    )
-    return WAITING_DATE
-
-
-# Получаем дату
-async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        end_date = datetime.strptime(text, "%d.%m.%Y").date()
-        if end_date < date.today():
-            await update.message.reply_text("❌ Дата уже прошла. Введи будущую дату:")
-            return WAITING_DATE
-    except ValueError:
-        await update.message.reply_text("❌ Неверный формат. Введи дату в виде ДД.ММ.ГГГГ:")
-        return WAITING_DATE
-
-    balance = context.user_data["balance"]
-    daily, days = calc_daily_budget(balance, end_date)
-
-    user_id = str(update.effective_user.id)
-    set_user_data(user_id, {
-        "balance": balance,
-        "end_date": text,
-        "set_date": date.today().strftime("%d.%m.%Y")
-    })
-
-    await update.message.reply_text(
-        f"🎉 Всё готово!\n\n"
-        f"💰 Баланс: {balance:,.2f} ₽\n"
-        f"📅 До: {text} ({days} дн.)\n"
-        f"📆 Можно тратить в день: *{daily:,.2f} ₽*",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
-    return ConversationHandler.END
-
-
-# Показать текущий бюджет
-async def show_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    info = get_user_data(user_id)
-
-    if not info:
-        await update.message.reply_text(
-            "У тебя ещё нет данных. Напиши /start чтобы начать.",
-            reply_markup=main_keyboard()
-        )
+    if text == "/start":
+        set_user(uid, {"state": WAITING_BALANCE})
+        await send(session, chat_id,
+            "👋 Привет! Я помогу следить за бюджетом.\n\nВведи текущий баланс (число):")
         return
 
-    balance = info["balance"]
-    end_date = datetime.strptime(info["end_date"], "%d.%m.%Y").date()
-    daily, days = calc_daily_budget(balance, end_date)
-
-    if days <= 0:
-        await update.message.reply_text(
-            f"⏰ Период закончился! Обнови баланс и дату.",
-            reply_markup=main_keyboard()
-        )
+    if text == "✏️ Обновить баланс":
+        user["state"] = WAITING_BALANCE
+        set_user(uid, user)
+        await send(session, chat_id, "Введи новый баланс:")
         return
 
-    await update.message.reply_text(
-        f"📊 *Твой бюджет*\n\n"
-        f"💰 Остаток: {balance:,.2f} ₽\n"
-        f"📅 До: {info['end_date']} ({days} дн.)\n"
-        f"📆 В день: *{daily:,.2f} ₽*",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
-    )
+    if text == "📅 Изменить дату":
+        if "balance" not in user:
+            await send(session, chat_id, "Сначала введи баланс через /start")
+            return
+        user["state"] = WAITING_DATE
+        set_user(uid, user)
+        await send(session, chat_id, "Введи новую дату (ДД.ММ.ГГГГ):")
+        return
+
+    if text == "📊 Мой бюджет":
+        if "balance" not in user or "end_date" not in user:
+            await send(session, chat_id, "У тебя нет данных. Напиши /start чтобы начать.", keyboard=main_kb())
+            return
+        daily, days = calc_daily(user["balance"], user["end_date"])
+        if days <= 0:
+            await send(session, chat_id, "⏰ Период закончился! Обнови баланс и дату.", keyboard=main_kb())
+        else:
+            await send(session, chat_id,
+                f"📊 *Твой бюджет*\n\n"
+                f"💰 Остаток: {user['balance']:,.2f} ₽\n"
+                f"📅 До: {user['end_date']} ({days} дн.)\n"
+                f"📆 В день: *{daily:,.2f} ₽*",
+                keyboard=main_kb())
+        return
+
+    if state == WAITING_BALANCE:
+        try:
+            balance = float(text.replace(",", ".").replace(" ", ""))
+            if balance < 0:
+                raise ValueError
+        except ValueError:
+            await send(session, chat_id, "❌ Введи корректное число, например: 15000")
+            return
+        user["balance"] = balance
+        user["state"] = WAITING_DATE
+        set_user(uid, user)
+        await send(session, chat_id,
+            f"✅ Баланс: {balance:,.2f} ₽\n\nТеперь введи дату до которой нужно дожить.\nФормат: ДД.ММ.ГГГГ, например: 31.03.2025")
+        return
+
+    if state == WAITING_DATE:
+        try:
+            end = datetime.strptime(text, "%d.%m.%Y").date()
+            if end < date.today():
+                await send(session, chat_id, "❌ Дата уже прошла. Введи будущую дату:")
+                return
+        except ValueError:
+            await send(session, chat_id, "❌ Неверный формат. Введи дату в виде ДД.ММ.ГГГГ:")
+            return
+        user["end_date"] = text
+        user["state"] = IDLE
+        set_user(uid, user)
+        daily, days = calc_daily(user["balance"], text)
+        await send(session, chat_id,
+            f"🎉 Всё готово!\n\n"
+            f"💰 Баланс: {user['balance']:,.2f} ₽\n"
+            f"📅 До: {text} ({days} дн.)\n"
+            f"📆 Можно тратить в день: *{daily:,.2f} ₽*",
+            keyboard=main_kb())
+        return
+
+    await send(session, chat_id, "Используй кнопки ниже 👇", keyboard=main_kb())
 
 
-# Обновить баланс — запускаем диалог заново
-async def update_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Введи новый баланс:",
-        reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
-    )
-    return WAITING_BALANCE
-
-
-# Изменить только дату
-async def update_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    info = get_user_data(user_id)
-    if not info:
-        await update.message.reply_text("Сначала введи баланс через /start")
-        return ConversationHandler.END
-
-    context.user_data["balance"] = info["balance"]
-    await update.message.reply_text(
-        "Введи новую дату (ДД.ММ.ГГГГ):",
-        reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True)
-    )
-    return WAITING_DATE
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.", reply_markup=main_keyboard())
-    return ConversationHandler.END
-
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.Regex("^✏️ Обновить баланс$"), update_balance),
-            MessageHandler(filters.Regex("^📅 Изменить дату$"), update_date),
-        ],
-        states={
-            WAITING_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_balance)],
-            WAITING_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_date)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Regex("^📊 Мой бюджет$"), show_budget))
-
-    logger.info("Бот запущен!")
-    app.run_polling()
+async def polling():
+    offset = 0
+    async with aiohttp.ClientSession() as session:
+        logger.info("Бот запущен!")
+        while True:
+            try:
+                result = await tg(session, "getUpdates", offset=offset, timeout=30)
+                updates = result.get("result", [])
+                for upd in updates:
+                    offset = upd["update_id"] + 1
+                    if "message" in upd:
+                        await handle_message(session, upd["message"])
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(polling())
