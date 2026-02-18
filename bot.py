@@ -301,6 +301,51 @@ async def handle_message(session, message):
             f"⏰ Буду напоминать каждый день в *{text}*!", keyboard=main_kb())
         return
 
+    # Умное распознавание: число = трата, +число = доход
+    if state == IDLE and "balance" in user and "end_date" in user:
+        parts = text.split(None, 1)
+        raw = parts[0].replace(",", ".")
+        is_income = raw.startswith("+")
+        raw_num = raw.lstrip("+")
+        try:
+            amount = float(raw_num)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await send(session, chat_id, "Используй кнопки ниже 👇", keyboard=main_kb())
+            return
+
+        desc = parts[1] if len(parts) > 1 else ""
+        desc_str = f" ({desc})" if desc else ""
+
+        if is_income:
+            user["balance"] = round(user["balance"] + amount, 2)
+            set_user(uid, user)
+            daily, days = calc_daily(user["balance"], user["end_date"])
+            await send(session, chat_id,
+                f"💚 Доход: *+{amount:,.0f} ₽*{desc_str}\n"
+                f"💰 Новый баланс: *{user['balance']:,.2f} ₽*\n"
+                f"📆 Новый лимит в день: *{daily:,.2f} ₽*",
+                keyboard=main_kb())
+        else:
+            if "expenses" not in user:
+                user["expenses"] = []
+            user["expenses"].append({"date": today_str(), "amount": amount, "desc": desc})
+            user["balance"] = round(user["balance"] - amount, 2)
+            set_user(uid, user)
+            daily, days = calc_daily(user["balance"], user["end_date"])
+            today_total = spent_today(user)
+            remaining = daily - today_total
+            if remaining < 0:
+                tip = f"⚠️ Перерасход на *{abs(remaining):,.0f} ₽*! Завтра придётся экономить."
+            else:
+                tip = f"✅ Ещё можно потратить сегодня: *{remaining:,.0f} ₽*"
+            await send(session, chat_id,
+                f"💸 Трата: *{amount:,.0f} ₽*{desc_str}\n"
+                f"💰 Остаток: *{user['balance']:,.2f} ₽*\n\n{tip}",
+                keyboard=main_kb())
+        return
+
     await send(session, chat_id, "Используй кнопки ниже 👇", keyboard=main_kb())
 
 
