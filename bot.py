@@ -111,6 +111,37 @@ async def handle_message(session, message):
 
     # ── Кнопки меню ────────────────────────────────────────
 
+    # Обработка выбора после поздравления за экономию
+    if text == "🎉 Потратить сегодня":
+        if "balance" not in user or "end_date" not in user:
+            await send(session, chat_id, "Нет данных.", keyboard=main_kb())
+            return
+        bonus = user.pop("saved_bonus", 0)
+        if bonus <= 0:
+            await send(session, chat_id, "Бонус уже использован.", keyboard=main_kb())
+            return
+        user["today_bonus"] = round(user.get("today_bonus", 0) + bonus, 2)
+        set_user(uid, user)
+        daily, _ = calc_daily(user["balance"], user["end_date"])
+        await send(session, chat_id,
+            f"🥳 Окей! Сегодня можно потратить: *{daily + user['today_bonus']:,.0f} ₽*\n"
+            f"_(базовый лимит {daily:,.0f} ₽ + бонус {bonus:,.0f} ₽)_",
+            keyboard=main_kb())
+        return
+
+    if text == "📅 Распределить на все дни":
+        if "balance" not in user or "end_date" not in user:
+            await send(session, chat_id, "Нет данных.", keyboard=main_kb())
+            return
+        user.pop("saved_bonus", None)
+        set_user(uid, user)
+        daily, days = calc_daily(user["balance"], user["end_date"])
+        await send(session, chat_id,
+            f"👍 Сумма распределена на оставшиеся дни.\n"
+            f"📆 Новый лимит в день: *{daily:,.2f} ₽*",
+            keyboard=main_kb())
+        return
+
     if text == "✏️ Обновить баланс":
         user["state"] = WAITING_BALANCE
         set_user(uid, user)
@@ -187,7 +218,9 @@ async def handle_message(session, message):
                 "⏰ Период закончился! Обнови баланс и дату.", keyboard=main_kb())
             return
 
-        remaining_today = daily - today_total
+        today_bonus = user.get("today_bonus", 0)
+        effective_daily = daily + today_bonus
+        remaining_today = effective_daily - today_total
         if remaining_today < 0:
             status = f"⚠️ *Перерасход на {abs(remaining_today):,.0f} ₽*"
         elif remaining_today == 0:
@@ -199,7 +232,7 @@ async def handle_message(session, message):
             f"📊 *Твой бюджет*\n\n"
             f"💰 Баланс: {user['balance']:,.2f} ₽\n"
             f"📅 До: {user['end_date']} ({days} дн.)\n"
-            f"📆 Лимит в день: *{daily:,.2f} ₽*\n"
+            f"📆 Лимит в день: *{effective_daily:,.2f} ₽*" + (f" _(+{today_bonus:,.0f} ₽ бонус)_" if today_bonus else "") + "\n"
             f"💸 Потрачено сегодня: {today_total:,.0f} ₽\n"
             f"{status}"
         )
@@ -350,6 +383,63 @@ async def handle_message(session, message):
 
 
 # ── Напоминания ────────────────────────────────────────────
+async def check_savings(session):
+    """Проверяем в начале нового дня — сэкономил ли пользователь вчера"""
+    all_users = get_all_users()
+    yesterday = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
+    
+    for uid, user in all_users.items():
+        if "balance" not in user or "end_date" not in user:
+            continue
+        if user.get("savings_checked") == yesterday:
+            continue  # уже проверяли
+
+        # Считаем сколько потратили вчера
+        expenses = user.get("expenses", [])
+        spent_yesterday = sum(e["amount"] for e in expenses if e["date"] == yesterday)
+        
+        # Считаем каким был лимит вчера (упрощённо: текущий баланс + вчерашние траты)
+        balance_yesterday = user["balance"] + spent_yesterday
+        _, days_left = calc_daily(user["balance"], user["end_date"])
+        days_yesterday = days_left + 1
+        if days_yesterday <= 0:
+            continue
+        
+        # Лимит на вчера
+        try:
+            end = datetime.strptime(user["end_date"], "%d.%m.%Y").date()
+            days_yesterday_count = (end - date.today()).days + 2
+            if days_yesterday_count <= 0:
+                continue
+            daily_yesterday = round(balance_yesterday / days_yesterday_count, 2)
+        except Exception:
+            continue
+
+        saved = round(daily_yesterday - spent_yesterday, 2)
+        
+        # Сбрасываем бонус прошлого дня
+        user.pop("today_bonus", None)
+        user["savings_checked"] = yesterday
+        
+        if saved > 0:
+            user["saved_bonus"] = saved
+            set_user(uid, user)
+            savings_kb = [
+                [{"text": "🎉 Потратить сегодня"}],
+                [{"text": "📅 Распределить на все дни"}]
+            ]
+            daily_new, days_new = calc_daily(user["balance"], user["end_date"])
+            await send(session, int(uid),
+                f"🌟 *Отличная работа вчера!*\n\n"
+                f"Ты сэкономила *{saved:,.0f} ₽* — это просто супер! 💪\n\n"
+                f"Что делаем с этой суммой?\n"
+                f"• *Потратить сегодня* — дневной лимит вырастет до *{daily_new + saved:,.0f} ₽*\n"
+                f"• *Распределить* — лимит каждого из {days_new} дней станет *{daily_new:,.2f} ₽*",
+                keyboard=savings_kb)
+        else:
+            set_user(uid, user)
+
+
 async def reminder_loop(session):
     sent_today = set()  # uid -> time чтобы не слать дважды
     last_date = date.today()
@@ -362,6 +452,7 @@ async def reminder_loop(session):
         if date.today() != last_date:
             sent_today.clear()
             last_date = date.today()
+            await check_savings(session)
 
         all_users = get_all_users()
         for uid, user in all_users.items():
